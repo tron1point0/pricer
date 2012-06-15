@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+# Author: Traian Nedelea <tron1point0@gmail.com>
+
+use v5.14;
+use warnings;
+
+use Tree::RB;
+
+my $target = 200;   # I keep forgetting to pass it the target >_<
+$ARGV[0] and $ARGV[0] =~ /^\d+$/ and $target = shift @ARGV;
+
+# Do the voodoo
+sub trade {
+    my ($remain, $cost) = ($target,0);
+    my ($tree) = @_;
+    my $iter = $tree->iter;
+    while (my $node = $iter->next) {
+        my ($price,$size) = ($node->key,$node->val);
+        $cost += $price * ($size <= $remain ? $size : $remain);
+        $remain -= $size;
+        last if $remain <= 0;
+    }
+    return join '.', unpack 'A4A2', $cost unless $remain > 0;
+    return 'NA';
+}
+
+my $bids = Tree::RB->new(sub {$_[0] <=> $_[1]});
+my $asks = Tree::RB->new(sub {$_[1] <=> $_[0]});
+
+# If we don't know the specific filter to use
+my %list_for = (
+    S => $bids,
+    B => $asks,
+);
+
+# Swap 'em for the output (You buy other peoples' sells)
+my %other = (
+    S => 'B',
+    B => 'S',
+);
+
+my %side_of;
+my %price_of;
+
+my %types = (
+    # Add and remove are mapped to their input stream definitions because it's
+    # easier that way
+    A => sub {
+        my ($orderId,$side,$price,$size) = @_;
+        $price *= 100;
+
+        # Caching the side because removals don't specify it
+        $side_of{$orderId} = $side;
+        $price_of{$orderId} = $price;
+
+        my $list = $list_for{$side};
+        my ($val,$node) = $list->get($price);
+
+        if ($node) {
+            $node->val($node->val + $size);
+        } else {
+            $list->put($price,$size);
+        }
+
+        return $other{$side}, trade($list);
+    },
+    R => sub {
+        my ($orderId,$size) = @_;
+
+        my $side = $side_of{$orderId};
+        my $price = $price_of{$orderId};
+        my $list = $list_for{$side};
+
+        my ($val,$node) = $list->get($price);
+
+        if ($node) {
+            $node->val($node->val - $size);
+            $list->delete($node->key) if $node->val <= 0;
+        }
+
+        return $other{$side}, trade($list);
+    },
+);
+
+# Don't tell me what I already know
+my %last = (
+    S => 'NA',
+    B => 'NA',
+);
+
+while (<>) {    # *Cackle*
+    my ($time,$type,@args) = split ' ', $_;
+
+    my ($side, $value) = $types{$type}->(@args);
+    say join ' ', $time, $side, $value if $last{$side} ne $value;
+    $last{$side} = $value if $side;
+}
+
+__END__;
+
+=head1 Name
+
+Pricer
+
+=head1 Summary
+
+Simulates a book of orders and the resulting trade costs/benefits
+
+=head1 Usage
+
+C<perl pricer.pl target-size [input file(s)...]>
+
+=over 4
+
+=item target-size
+
+The number of shares you want to simulate buying and selling
+
+=item input file(s)
+
+Any other arguments are assumed to be input files and will be parsed the same
+as STDIN
+
+=back
+
+=head2 Examples
+
+    $ perl pricer.pl 200 test.in
+    28800758 S 8832.56
+    28800796 S NA
+    ... snip ...
+    28815937 B 8845.00
+    28816245 B 8840.00
+
+=head1 Notes
+
+In the process of trying to improve the linked list version, I had the idea to
+try storing the orders in a Red/Black tree. It turns out that the added
+overhead of the tree actually just slows it down. Since the slowdown was
+significant, I didn't bother implementing my own Red/Black tree and instead
+continued to work on the sorted array solution.
+
+=head1 Legal
+
+=head2 License
+
+This program is free software. It comes without any warranty, to
+the extent permitted by applicable law. You can redistribute it
+and/or modify it under the terms of the Do What The Fuck You Want
+To Public License, Version 2, as published by Sam Hocevar. See
+http://sam.zoy.org/wtfpl/COPYING for more details.
+
+=head2 Copyright
+
+Copyright (c) 2011 Traian Nedelea <tron1point0@gmail.com>
+
+=cut
+

@@ -1,0 +1,324 @@
+#!/usr/bin/env perl
+# Author: Traian Nedelea <tron1point0@gmail.com>
+
+use v5.14;
+use warnings;
+
+package List::Sorted;
+# Keeps a pre-sorted linked list. Copied here instead of as a separate module
+# to make it easier to just grab the script and run it.
+
+# Accepts a comparator function that will be used to sort the elements in the
+# list. The two arguments passed to the comparator are the two elements being
+# compared, and, much like the <=> operator, the function should return:
+#   -1 if $a < b
+#   0  if $a == b
+#   1  if $a > b
+sub new {
+    my $class = shift;
+    my ($cmp) = @_;
+    $cmp ||= sub {$_[0] <=> $_[1]};
+    my $head = [undef,undef];
+    bless {
+        head => $head,
+        cmp => $cmp,
+    }, $class;
+}
+
+# Inserts an element to the proper position in the pre-sorted list.
+#
+# Runtime is O(N)
+sub insert {
+    my $this = shift;
+    my ($value) = @_;
+    _insert($this->{cmp},\$this->{head},$value);
+}
+sub _insert {
+    my ($cmp,$first,$value) = @_;
+    while ($$first->[0]) {
+        return $$first = [$value,$$first] if $cmp->($value,$$first->[0]) <= 0;
+        $first = \$$first->[1];
+    }
+    return $$first = [$value,undef];
+}
+
+# Returns an element that causes the test function to return 0
+# Yes, it's weird, but this mimics the behavior of the <=> operator, so, if you
+# have a list of numbers, you can just say
+#   sub {$_[0] <=> 3}
+# and it will return a ref to the first node that is a 3.
+# Returns undef if a matching node doesn't exist.
+#
+# Runtime is O(N)
+sub find {
+    my $this = shift;
+    my ($cmp) = @_;
+    _find($cmp,\$this->{head});
+}
+sub _find {
+    my ($cmp,$first) = @_;
+    while (defined $$first->[0]) {
+        my $c = $cmp->($$first->[0]);
+        return $first if $c == 0;
+        return if $c < 0;
+        $first = \$$first->[1];
+    }
+}
+
+# Deletes a node that matches the test function, which itself behaves exactly
+# like find()'s test function. Returns undef if a matching node doesn't exist.
+#
+# Runtime is O(N)
+sub delete {
+    my $this = shift;
+    my ($cmp) = @_;
+    my $node = $this->find($cmp);
+    $$node = $$node->[1] if $node;
+}
+
+sub head {
+    my $this = shift;
+    return $this->{head};
+}
+
+1;
+
+package main;
+
+use threads;
+use threads::shared;
+use Thread::Queue;
+use Storable qw(freeze thaw);
+
+sub merge (&$$) {
+    my $cmp = shift;
+    local $a = shift;
+    local $b = shift;
+    return $cmp->() > 0 ? ($b,$a) : ($a,$b);
+}
+
+my $target = 200;   # I keep forgetting to pass it the target >_<
+$ARGV[0] and $ARGV[0] =~ /^\d+$/ and $target = shift @ARGV;
+
+# Do the voodoo
+sub trade {
+    my ($remain, $cost) = ($target,0);
+    my ($elem) = @_;
+    while ($remain and defined $elem->[0]){
+        my $order = $elem->[0];
+        my $price = $order->{price};
+        my $size = $order->{size};
+        $cost += $price * ($size <= $remain ? $size : $remain);
+        $remain -= $size;
+        $remain = 0, last if $remain <= 0;
+        $elem = $elem->[1];
+    }
+    return join '.',unpack("A4A2",$cost) unless $remain;
+    return 'NA';
+}
+
+my ($bids,$asks) = (
+    # Bids are highest-first
+    List::Sorted->new(sub {-1 * &by_price}),
+    # Asks are lowest-first
+    List::Sorted->new(\&by_price),
+);
+
+# Filters for bids and asks
+sub by_price {
+    return $_[0]{price} <=> $_[1]{price};
+}
+
+my %list_for = (
+    S => $asks,
+    B => $bids,
+);
+
+# Swap 'em for the output (You buy other peoples' sells)
+my %other = (
+    S => 'B',
+    B => 'S',
+);
+
+# Cachy cache cache cache
+my %side_of;
+my %price_of;
+
+my %types = (
+    # Add and remove are mapped to their input stream definitions because it's
+    # easier that way
+    A => sub {
+        my ($orderId,$side,$price,$size) = @_;
+
+        my %order = (
+            id => $orderId,
+            side => $side,
+            price => $price * 100,
+            size => $size,
+        );
+
+        # Caching the side because removals don't specify it
+        $side_of{$orderId} = $side;
+        # Caching the price for faster lookups
+        $price_of{$orderId} = $price;
+
+        my $list = $list_for{$side};
+        $list->insert(\%order);
+        return $other{$side}, trade($list->head);
+    },
+    R => sub {
+        my ($orderId,$size) = @_;
+
+        my $side = $side_of{$orderId};
+        my $price = $price_of{$orderId};
+        my $list = $list_for{$side};
+
+        my $node = $list->find(sub {
+            return 0 if $_[0]{id} eq $orderId;
+            # $list is pre-sorted, so stop looking after this price
+            return $_[0]{price} <=> $price;
+        });
+        $$node->[0]->{size} -= $size;
+        # Delete the order if it's empty
+        $$node = $$node->[1] if $$node->[0]{size} <= 0;
+        return $other{$side}, trade($list->head);
+    },
+);
+
+# Don't tell me what I already know
+my %last = (
+    S => 'NA',
+    B => 'NA',
+);
+
+my $bidq = Thread::Queue->new;
+my $bidp = Thread::Queue->new;
+my $askq = Thread::Queue->new;
+my $askp = Thread::Queue->new;
+
+my $bid_worker = threads->create(sub {
+    while (my $msg = thaw($bidq->dequeue)) {
+        last if $msg->[0] eq 'BREAK';
+        my ($time,$type,@args) = @$msg;
+        my ($side, $value) = $types{$type}->(@args);
+        $bidp->enqueue(freeze([$time,$side,$value]));
+    }
+    $bidp->enqueue(freeze(['BREAK']));
+    $bidp->enqueue(freeze(['END']));
+});
+
+my $ask_worker = threads->create(sub {
+    while (my $msg = thaw($askq->dequeue)) {
+        last if $msg->[0] eq 'BREAK';
+        my ($time,$type,@args) = @$msg;
+        my ($side, $value) = $types{$type}->(@args);
+        $askp->enqueue(freeze([$time,$side,$value]));
+    }
+    $askp->enqueue(freeze(['BREAK']));
+    $askp->enqueue(freeze(['END']));
+});
+
+my $merger = threads->create(sub {
+    my %last = (
+        B => 'NA',
+        S => 'NA',
+    );
+    while (my $bid = thaw($bidp->dequeue) and my $ask = thaw($askp->dequeue)) {
+        last if $bid->[0] eq 'BREAK' || $ask->[0] eq 'BREAK';
+        my @print = merge {$a->[0] <=> $b->[0]} $bid,$ask;
+        for (@print) {
+            my ($time,$side,$value) = @$_;
+            say join ' ', @$_ if $last{$side} ne $value;
+            $last{$side} = $value if $side;
+        }
+    }
+    while (my $bid = thaw($bidp->dequeue)) {
+        last if $bid->[0] eq 'END';
+        my ($time,$side,$value) = @$bid;
+        say join ' ', @$bid if $last{$side} ne $value;
+        $last{$side} = $value if $side;
+    }
+    while (my $ask = thaw($askp->dequeue)) {
+        last if $ask->[0] eq 'END';
+        my ($time,$side,$value) = @$ask;
+        say join ' ', @$ask if $last{$side} ne $value;
+        $last{$side} = $value if $side;
+    }
+});
+
+my %queue = (
+    B => $bidq,
+    S => $askq,
+);
+
+while (<>) {    # *Cackle*
+    my ($time,$type,@args) = split ' ', $_;
+
+    $queue{$args[2]}->enqueue(freeze([$time,$type,@args])), next if $args[0] eq 'A';
+    $bidq->enqueue(freeze([$time,$type,@args]));
+    $askq->enqueue(freeze([$time,$type,@args]));
+}
+
+$bidq->enqueue(freeze(['BREAK']));
+$askq->enqueue(freeze(['BREAK']));
+
+$bid_worker->join();
+$ask_worker->join();
+$merger->join();
+
+__END__;
+
+=head1 Name
+
+Pricer
+
+=head1 Summary
+
+Simulates a book of orders and the resulting trade costs/benefits
+
+=head1 Usage
+
+C<perl pricer.pl target-size [input file(s)...]>
+
+=over 4
+
+=item target-size
+
+The number of shares you want to simulate buying and selling
+
+=item input file(s)
+
+Any other arguments are assumed to be input files and will be parsed the same
+as STDIN
+
+=back
+
+=head2 Examples
+
+    $ perl pricer.pl 200 test.in
+    28800758 S 8832.56
+    28800796 S NA
+    ... snip ...
+    28815937 B 8845.00
+    28816245 B 8840.00
+
+=head1 Notes
+
+Man, this was a bad decision. The queues ended up B<doubling> the run time.
+
+=head1 Legal
+
+=head2 License
+
+This program is free software. It comes without any warranty, to
+the extent permitted by applicable law. You can redistribute it
+and/or modify it under the terms of the Do What The Fuck You Want
+To Public License, Version 2, as published by Sam Hocevar. See
+http://sam.zoy.org/wtfpl/COPYING for more details.
+
+=head2 Copyright
+
+Copyright (c) 2011 Traian Nedelea <tron1point0@gmail.com>
+
+=cut
+
