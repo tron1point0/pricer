@@ -37,6 +37,7 @@ inline node_t * Node (int key, int val) {
 list_t * List (int (*cmp)(int,int)) {
     list_t *list = (list_t *) malloc(sizeof(list_t));
     list->cmp = cmp;
+    list->head = NULL;
     return list;
 }
 
@@ -237,14 +238,20 @@ inline int read_int () {
     return i;
 }
 
-inline unsigned long read_ulong () {
+inline unsigned long pow (int base,unsigned char exp) {
+    if (exp == 0) return 1;
+    unsigned long r = base;
+    while (exp--) r *= base;
+    return r;
+}
+
+inline unsigned long read_orderId () {
     char c;
     unsigned long i = 0;
+    unsigned char digits = 0;
     next_char(c);
-    while (c >= '0' && c <= '9') {
-        c -= '0';
-        i *= 10;
-        i += c;
+    while (c >= 'a' && c <= 'z') {
+        i += (c - 'a') * pow(26,digits++);
         next_char(c);
     }
     return i;
@@ -268,7 +275,7 @@ inline int read_prefix (char *time, char *type, unsigned long *orderId) {
     }
     *type = read_char();
     next_char(c);
-    *orderId = read_ulong();
+    *orderId = read_orderId();
     return 1;
 }
 
@@ -368,4 +375,6 @@ int main(int argc, char *argv[]) {
     free(side_of);
     free_list(asks);
     free_list(bids);
+
+    return 0;
 }
